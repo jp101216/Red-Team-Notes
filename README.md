@@ -15,6 +15,7 @@ I'm currently pursuing offensive security and detection engineering roles. You c
 | Write-Up | Focus |
 |---|---|
 | [Full Endpoint Compromise — Home Lab AD Attack Chain](./goad-lab-case-study.md) | End-to-end Windows 11 compromise: WMI execution, token-impersonation privilege escalation, scheduled-task persistence, and credential extraction — mapped to MITRE ATT&CK with detection and remediation guidance for each stage |
+| [Adversary Emulation — Custom C2, UAC Bypass & BYOVD](./Adversary%20Emulation%20Case%20Study%20-%20Custom%20C2%20to%20SYSTEM%20via%20BYOVD.md) | Assumed-breach emulation with a custom Rust implant over DNS-over-HTTPS: in-memory evasion, UAC bypass, BYOVD kernel escalation to SYSTEM, and scheduled-task persistence — scored against a Defender, Sysmon, and Wazuh stack, with Sigma rules and remediation for each gap |
 
 *More write-ups added as lab work continues — upcoming topics include Sysmon/Wazuh detection rule development and APT threat intelligence breakdowns.*
 
