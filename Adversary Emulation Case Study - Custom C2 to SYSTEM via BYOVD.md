@@ -31,11 +31,11 @@
 | :--- | :--- |
 | **Assessment Type** | Assumed-Breach Adversary Emulation & Detection Validation |
 | **Engagement ID** | `[LAB-2026-XXX]` |
-| **Assessment Window** | `[Start Date]` – November 23, 2026 |
+| **Assessment Window** | November 20 – 23, 2026 |
 | **Operator** | Jessie Parker |
 | **Target Environment** | `[TARGET-HOST-01]` — Windows 11 `[edition / build]` on an isolated lab subnet |
 | **Emulation Stack** | **Project Lattice** (Go teamserver) + **Wraith** (Rust implant), DNS-over-HTTPS to a teamserver-hosted endpoint |
-| **Primary Kill Chain** | Wraith at medium integrity ➔ AMSI/ETW patch, stack spoofing & sleep obfuscation ➔ **DoH** beacon ➔ **UAC bypass** to high integrity ➔ **BYOVD** token swap to SYSTEM ➔ disguised startup **Scheduled Task** |
+| **Primary Kill Chain** | Wraith at medium integrity ➔ VEH-based AMSI/ETW bypass, stack spoofing & sleep obfuscation ➔ **DoH** beacon ➔ **UAC bypass** to high integrity ➔ **BYOVD** token swap to SYSTEM ➔ disguised startup **Scheduled Task** |
 | **Privilege Achieved** | Medium-integrity session (local admin account) ➔ high-integrity admin ➔ kernel read/write ➔ `NT AUTHORITY\SYSTEM` with reboot-resilient persistence |
 | **Detection Outcome** | 0 Defender detections · 0 Wazuh alerts across all five phases |
 | **Overall Risk Rating** | **Critical** |
@@ -61,11 +61,11 @@
 
 ## 📄 1. Executive Summary
 
-Between `[Start Date]` and November 23, 2026, a five-phase adversary emulation was run against a Windows 11 host in an isolated home lab to measure how well a common defensive stack — **Microsoft Defender Antivirus** and **Sysmon** forwarding to a **Wazuh** SIEM — prevents, logs, and alerts on modern post-exploitation tradecraft. The operator used **Project Lattice**, a custom C2 framework with a Go teamserver, and its Rust implant **Wraith**, starting from an assumed-breach foothold: medium-integrity execution under a local administrator account.
+Between November 20 and November 23, 2026, a five-phase adversary emulation was run against a Windows 11 host in an isolated home lab to measure how well a common defensive stack — **Microsoft Defender Antivirus** and **Sysmon** forwarding to a **Wazuh** SIEM — prevents, logs, and alerts on modern post-exploitation tradecraft. The operator used **Project Lattice**, a custom C2 framework with a Go teamserver, and its Rust implant **Wraith**, starting from an assumed-breach foothold: medium-integrity execution under a local administrator account.
 
 **Outcome.** Wraith bypassed User Account Control to reach high integrity, loaded a signed vulnerable kernel driver (BYOVD) to escalate to `NT AUTHORITY\SYSTEM`, and registered a disguised startup Scheduled Task that restored the DoH beacon after a controlled reboot. **No Defender detection and no Wazuh alert fired at any phase.**
 
-**Why it matters.** Not every phase was invisible. The UAC bypass, the kernel driver install, and the task registration all write native Windows and Sysmon events by design; those stages went unalerted because no correlation rule existed. The in-memory evasion layer is different: AMSI/ETW patching, spoofed call stacks, and sleep obfuscation target user-mode sensors and scheduled memory scans, and the lab stack has no kernel-level (ETW Threat-Intelligence) visibility to fall back on. Section 6 separates the two — a logging gap is fixed with rules; a visibility gap is fixed with a sensor.
+**Why it matters.** Not every phase was invisible. The UAC bypass, the kernel driver install, and the task registration all write native Windows and Sysmon events by design; those stages went unalerted because no correlation rule existed. The in-memory evasion layer is different: the VEH-based AMSI/ETW bypass, spoofed call stacks, and sleep obfuscation target user-mode sensors and scheduled memory scans, and the lab stack has no kernel-level (ETW Threat-Intelligence) visibility to fall back on. Section 6 separates the two — a logging gap is fixed with rules; a visibility gap is fixed with a sensor.
 
 **Root causes.**
 1. **Standing local admin under default UAC** turned a medium-integrity foothold into a silent path to an elevated token.
@@ -95,7 +95,7 @@ sequenceDiagram
 
     Note over Host,Sensors: Phase 1: Execution & Defense Evasion (medium integrity)
     Host->>Host: Wraith starts under local admin account, filtered token
-    Host->>Host: In-process AMSI + ETW patch, spoofed-stack indirect syscalls
+    Host->>Host: VEH + hardware-breakpoint AMSI/ETW bypass, spoofed-stack syscalls
     Host->>Host: Sleep obfuscation encrypts image, pages flipped to RW
     Host-->>Sensors: Telemetry: Sysmon 1, user-mode signals suppressed (no alert)
 
@@ -127,8 +127,8 @@ Mapped to **ATT&CK v20**. Since v19, the former Defense Evasion tactic is split 
 
 | Tactic | Technique ID | Technique Name | Adversary Emulation Procedure | Detection Result |
 | :--- | :--- | :--- | :--- | :--- |
-| **Defense Impairment** | **T1685** | Disable or Modify Tools | Patched `AmsiScanBuffer` in-process to blind AMSI buffer scanning. | Not alerted · no lab visibility |
-| **Defense Impairment** | **T1685** | Disable or Modify Tools | Patched user-mode `EtwEventWrite` / `NtTraceEvent` in-process to suppress user-mode ETW from the implant process. | Not alerted · no lab visibility |
+| **Defense Impairment** | **T1685** | Disable or Modify Tools | Patchless AMSI bypass: a hardware breakpoint on `AmsiScanBuffer`, handled by a vectored exception handler (VEH) that skips the scan and returns a clean result — no code bytes modified. | Not alerted · no lab visibility |
+| **Defense Impairment** | **T1685** | Disable or Modify Tools | Patchless ETW bypass: the same VEH and hardware-breakpoint method on `EtwEventWrite` / `NtTraceEvent`, suppressing user-mode ETW from the implant process. | Not alerted · no lab visibility |
 | **Execution** | **T1106** | Native API | Indirect syscalls routed through synthetic, unwind-consistent call stacks (SilentMoonwalk-style spoofing). | Not alerted · no lab visibility |
 | **Stealth** | **T1027** | Obfuscated Files or Information | Timer/APC-driven sleep obfuscation (Ekko / Zilean / Foliage-style) encrypted the implant image and flipped its pages from executable to `RW` between check-ins. | Not alerted · no lab visibility |
 | **Command and Control** | **T1071.004** | Application Layer Protocol: DNS | C2 tasking and responses encoded in DNS messages carried over DoH directly to an endpoint hosted by the Lattice teamserver. | Not alerted · partial telemetry |
@@ -192,7 +192,7 @@ sysmon64.exe -c
 ### 4.1 Phase 1 — Initial Execution & Defense Evasion (`T1685`, `T1106`, `T1027`)
 Under the assumed-breach baseline, Wraith started in a medium-integrity process under the local administrator account. Before any privileged or network-heavy action, it layered three evasions:
 
-* **AMSI and user-mode ETW patching:** `AmsiScanBuffer` and `EtwEventWrite` / `NtTraceEvent` were patched inside the implant process only — blinding buffer scanning and user-mode ETW from that process, not system-wide.
+* **Patchless AMSI and ETW bypass (VEH):** Instead of overwriting code, Wraith registered a vectored exception handler and set hardware breakpoints (debug registers `Dr0`–`Dr3`) on `AmsiScanBuffer` and `EtwEventWrite` / `NtTraceEvent`. Each call raised a single-step exception, and the handler rewrote the thread context to skip the function and return a clean result. `amsi.dll` and `ntdll.dll` stay byte-for-byte identical to their on-disk images, so the integrity checks that catch classic patching see nothing. The effect is limited to the implant process.
 * **Call-stack spoofing:** Sensitive calls went through indirect syscalls with a synthetic stack built from valid unwind metadata (SilentMoonwalk-style). Stack walks see return addresses inside signed system modules instead of unbacked private memory.
 * **Sleep obfuscation:** Between check-ins, timer/APC-driven sleep (Ekko / Zilean / Foliage-style) encrypted the implant image and flipped its pages from executable to `RW`, defeating scheduled memory scans.
 
@@ -240,7 +240,7 @@ Running as SYSTEM, the operator registered `[TaskName]` — named and placed to 
 
 | Timestamp (UTC) | Phase | Action Performed | Native Telemetry | Alerted |
 | :--- | :--- | :--- | :--- | :--- |
-| `[YYYY-MM-DD HH:MM]` | Execution & Evasion | Wraith launched at medium integrity; AMSI/ETW patch, stack spoofing, sleep obfuscation active | Sysmon 1 | **No** |
+| `[YYYY-MM-DD HH:MM]` | Execution & Evasion | Wraith launched at medium integrity; VEH AMSI/ETW bypass, stack spoofing, sleep obfuscation active | Sysmon 1 | **No** |
 | `[YYYY-MM-DD HH:MM]` | Command & Control | DoH beacon established to the Lattice teamserver | Sysmon 3 | **No** |
 | `[YYYY-MM-DD HH:MM]` | Privilege Escalation (Admin) | UAC bypass: medium ➔ high integrity | Sysmon 1, 12, 13 | **No** |
 | `[YYYY-MM-DD HH:MM]` | Privilege Escalation (SYSTEM) | Signed vulnerable driver loaded; token swapped to SYSTEM | 7045, 4697, Sysmon 6, 11, 13 | **No** |
@@ -254,7 +254,9 @@ Each phase is listed with the telemetry it generates on the target. Where a tech
 
 ### 5.1 Phase 1 — Execution & Defense Evasion
 * **Sysmon Event ID 1 (Process Create):** Wraith's host process (`[wraith_host.exe]`) — unsigned, `IntegrityLevel: Medium`, `User` = the local admin account. Capture `Hashes` and `ParentImage`; the hash is the pivot point for every later phase.
-* **AMSI / ETW patches:** No native event. Detectable by integrity-checking loaded modules — a modified `.text` section in `amsi.dll` or `ntdll.dll` versus the on-disk image (e.g., PE-sieve or Moneta in a hunt).
+* **VEH-based AMSI / ETW bypass:** No native event, and no modified bytes — an in-memory integrity check of `amsi.dll` or `ntdll.dll` comes back clean, which is the point of the patchless method. It is still huntable on a live host:
+  * **Debug registers:** threads whose `Dr0`–`Dr3` hold the addresses of `AmsiScanBuffer`, `EtwEventWrite`, or `NtTraceEvent`. Legitimate software almost never sets hardware breakpoints outside a debugger.
+  * **Exception handlers:** a vectored exception handler registered in the process whose address points into unbacked private memory rather than a loaded module.
 * **Spoofed call stacks:** Built specifically to pass stack inspection. The reliable counter is kernel-side stack collection with unwind validation inside an EDR.
 * **Sleep obfuscation:** While asleep, the implant is encrypted `RW` memory. During brief execution windows it is executable private memory not backed by a file on disk, and its sleeping threads wait from timer/APC callback chains — both huntable with sleeping-thread call-stack analysis. Repeated `RW` ↔ `RX` flips surface as kernel ETW Threat-Intelligence protect-memory events, which EDRs consume and Sysmon does not.
 
@@ -296,8 +298,8 @@ Why did a chain with this many native events produce zero alerts? Each technique
 
 | Technique | What It Blinds | What It Does **Not** Blind | Surviving Detection Opportunity |
 | :--- | :--- | :--- | :--- |
-| **AMSI patch (in-process)** | AMSI buffer scans inside the implant process | Kernel callbacks, Sysmon, ETW Threat-Intelligence | `.text` integrity check of `amsi.dll` in memory |
-| **User-mode ETW patch** | User-mode ETW providers emitting from the implant process | Kernel ETW providers (incl. Threat-Intelligence); Sysmon's kernel-driver-sourced events | Same integrity check on `ntdll.dll` |
+| **AMSI bypass (VEH + hardware breakpoint)** | AMSI buffer scans inside the implant process — without modifying `amsi.dll`, so integrity checks come back clean | Kernel callbacks, Sysmon, ETW Threat-Intelligence | Debug registers pointing at `AmsiScanBuffer`; VEH handler in unbacked memory |
+| **ETW bypass (VEH + hardware breakpoint)** | User-mode ETW providers emitting from the implant process | Kernel ETW providers (incl. Threat-Intelligence); Sysmon's kernel-driver-sourced events | Debug registers pointing at the ETW write path; same VEH check |
 | **Indirect syscalls + spoofed stacks** | User-mode `ntdll` hooks; naive stack walks | Kernel process, thread, image, and registry callbacks; ETW-TI syscall telemetry | Kernel-side stack collection with unwind validation |
 | **Sleep obfuscation** | Scheduled memory scans while the implant sleeps | Execution windows between sleeps; thread wait-state anomalies; ETW-TI protect-memory events | Hunts timed to execution; sleeping-thread call-stack analysis |
 | **DoH transport (self-hosted endpoint)** | Endpoint and internal DNS logging (Sysmon 22, DNS server logs); public-resolver blocklists | TCP/TLS connection metadata (Sysmon 3, SNI, JA4), the endpoint hostname lookup, and beacon timing | DoH to non-approved hosts under TLS inspection; newly registered domains; periodicity analysis |
@@ -470,13 +472,13 @@ The compromise rests on four root causes — **standing local admin under defaul
 ### RT-02: In-Memory Evasion Blinds User-Mode Telemetry
 * **Severity:** Critical · **Affected:** `[TARGET-HOST-01]` · **ATT&CK:** `T1685`, `T1106`, `T1027`
 
-**Description.** Wraith combined in-process AMSI and ETW patching, indirect syscalls with spoofed call stacks, and sleep obfuscation. Each technique targets a user-mode sensor or a scheduled scan. The lab stack has no kernel-level memory or syscall telemetry, so no behavioral or memory-integrity signal existed to alert on.
+**Description.** Wraith combined a patchless, VEH-based AMSI and ETW bypass, indirect syscalls with spoofed call stacks, and sleep obfuscation. Each technique targets a user-mode sensor or a scheduled scan. The lab stack has no kernel-level memory or syscall telemetry, so no behavioral or memory-integrity signal existed to alert on.
 
 **Evidence.** Implant process `[wraith_host.exe / PID]` · Sleep profile `[45s / 25% jitter, RW masking active]` · Console check `[zero Defender detections and zero Wazuh alerts for the window]`
 
 **Remediation.**
-1. **Use an EDR that consumes `Microsoft-Windows-Threat-Intelligence` ETW.** It is emitted from the kernel and cannot be patched from user mode, but only protected anti-malware processes can subscribe — which is why Sysmon and the Wazuh agent never saw this layer. Its protect-memory events (`EtwTiLogProtectExecVm`) are what expose cyclic `RW` ↔ `RX` flips.
-2. **Hunt memory during execution windows,** not only on a schedule: module integrity checks for patched `amsi.dll` / `ntdll.dll`, and sleeping-thread call-stack analysis.
+1. **Use an EDR that consumes `Microsoft-Windows-Threat-Intelligence` ETW.** It is emitted from the kernel and cannot be blinded from user mode, by patching or by VEH, but only protected anti-malware processes can subscribe — which is why Sysmon and the Wazuh agent never saw this layer. Its protect-memory events (`EtwTiLogProtectExecVm`) are what expose cyclic `RW` ↔ `RX` flips.
+2. **Hunt memory during execution windows,** not only on a schedule: thread debug registers set on AMSI or ETW functions, vectored exception handlers pointing into unbacked memory, and sleeping-thread call-stack analysis. Module integrity checks alone won't catch a patchless bypass.
 3. **Enable Hardware-enforced Stack Protection** where supported. It only covers CET-compatible processes, so verify that the host binaries you care about are in scope before counting on it.
 
 ---
